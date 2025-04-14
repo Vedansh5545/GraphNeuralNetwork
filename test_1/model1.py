@@ -1,6 +1,6 @@
 ############################################################
 # full_pose_pipeline_accurate.py
-# Vedansh – Optimized CNN + Dynamic Graph EGCN for 2D Pose Estimation
+# Vedansh – Optimized CNN + Enhanced GCN for Accurate 2D Pose Estimation
 ############################################################
 import math, json, random, pathlib, time
 from typing import List, Tuple
@@ -31,6 +31,8 @@ class CocoKeypointDataset(CocoDetection):
         self.K = 17
         self.tf = transforms.Compose([
             transforms.Resize((image_size, image_size)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.RandomRotation(10),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
@@ -55,10 +57,10 @@ class CocoKeypointDataset(CocoDetection):
 class KeypointCNN(nn.Module):
     def __init__(self, num_kpts=17):
         super().__init__()
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.heatmap_head = nn.Sequential(
-            nn.Conv2d(512, 256, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(2048, 256, 3, padding=1), nn.ReLU(),
             nn.Upsample(scale_factor=2, mode='bilinear'),
             nn.Conv2d(256, 64, 3, padding=1), nn.ReLU(),
             nn.Upsample(scale_factor=2),
@@ -76,7 +78,7 @@ def extract_kpt_coords(heatmaps, topk=1):
     conf, ind = flat.max(-1)
     y, x = ind.div(W, rounding_mode='floor'), ind % W
     coords = torch.stack([x, y], dim=-1).float()
-    return coords, conf.sigmoid()
+    return coords / W, conf.sigmoid()  # Normalized to [0, 1]
 
 def build_knn_graph(coords, k=4):
     K = coords.size(0)
@@ -118,7 +120,6 @@ class PoseEGCN(nn.Module):
     def forward(self, img):
         heatmaps = self.cnn(img)
         coords, conf = extract_kpt_coords(heatmaps)
-        coords_scaled = coords * 8.0
         B, K = conf.shape
         h = self.embed(conf.unsqueeze(-1))
         out_coords = []
@@ -131,7 +132,8 @@ class PoseEGCN(nn.Module):
             out = self.final(h_b)
             out_coords.append(out)
         offsets = torch.cat(out_coords, dim=0)
-        return coords_scaled + offsets, conf
+        final_coords = torch.clamp(coords * 256 + offsets, 0, 255)
+        return final_coords, conf
 
 # -------------------- Loss Functions ------------------ #
 def heatmap_loss(pred_heat, gt_kpts, sigma=2):
@@ -165,10 +167,10 @@ def train_one_epoch(model, loader, optimizer, device):
         optimizer.zero_grad()
         pred_heat = model.cnn(img)
         coords_pred, _ = extract_kpt_coords(pred_heat)
-        coords_pred = coords_pred * 8.0
+        coords_pred = coords_pred * 256  # scaled back
         mask = (kpts[..., 2] > 0).unsqueeze(-1)
         l1 = (torch.abs(coords_pred - kpts[..., :2]) * mask).mean()
-        loss = heatmap_loss(pred_heat, kpts) + 0.1 * l1
+        loss = 5.0 * heatmap_loss(pred_heat, kpts) + 0.1 * l1
         loss.backward()
         optimizer.step()
         running_loss += loss.item()
